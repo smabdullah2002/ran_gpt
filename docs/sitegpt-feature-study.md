@@ -133,7 +133,7 @@ Inferred requirements:
 - One chatbot per tenant initially
 - URL + file + raw text ingestion
 - RAG chat with citations
-- Embeddable website widget
+- Embeddable website widget 
 - Chat history dashboard
 - Lead capture form + basic export
 - Human escalation to email and Slack
