@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import heapq
+import logging
 import re
+import sys
 from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlencode, urljoin, urldefrag, urlparse
 import xml.etree.ElementTree as ET
 
 import aiohttp
 from bs4 import BeautifulSoup
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -72,6 +77,8 @@ def _is_junk_query_key(key: str) -> bool:
 def _is_disallowed_path(url: str) -> bool:
     path = (urlparse(url).path or "").lower()
     blocked_tokens = ("/login", "/signup", "/cart", "/admin")
+    if re.match(r"^/sitemap-page/\d+/\d+/?$", path):
+        return True
     return any(token in path for token in blocked_tokens)
 
 
@@ -551,6 +558,9 @@ class URLCrawler:
         return self._extract_links(rendered_html, url)
 
     async def _render_html_with_browser(self, url: str) -> str | None:
+        if not _is_playwright_loop_supported():
+            return None
+
         try:
             browser = await self._ensure_browser()
             if browser is None:
@@ -658,4 +668,18 @@ def _looks_like_discoverable_route(route: str) -> bool:
         return False
     if _has_static_asset_extension(route):
         return False
+    return True
+
+
+def _is_playwright_loop_supported() -> bool:
+    if sys.platform != "win32":
+        return True
+
+    loop = asyncio.get_running_loop()
+    if isinstance(loop, asyncio.SelectorEventLoop):
+        logger.debug(
+            "Detected Windows SelectorEventLoop; skipping Playwright browser rendering."
+        )
+        return False
+
     return True

@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import re
 import sys
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import aiohttp
 from bs4 import BeautifulSoup
 
 from .detector import discover_api_candidates
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -48,9 +53,6 @@ class ContentExtractor:
                                 continue
                             raise RuntimeError(f"HTTP {response.status} for {url}")
                         text = await response.text(errors="ignore")
-                        if _is_homepage(url):
-                            print(response.status)
-                            print(text[:1000])
                         return text
                 except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                     if attempt < self.retries:
@@ -98,13 +100,24 @@ class ContentExtractor:
                 return self._extract_lenient_fallback(url, raw_html, forced_method="html_fallback")
 
     async def _extract_from_api(self, page_url: str, raw_html: str) -> ExtractionResult:
-        candidates = discover_api_candidates(page_url, raw_html)
-        if not candidates:
-            raise RuntimeError("No API endpoint candidates found")
-
         timeout = aiohttp.ClientTimeout(total=self.request_timeout_seconds)
         async with aiohttp.ClientSession(timeout=timeout, headers=self.headers) as session:
-            for candidate in candidates[:8]:
+            candidates = await self._discover_api_candidates_with_external_scripts(
+                page_url=page_url,
+                raw_html=raw_html,
+                session=session,
+            )
+
+            if not candidates:
+                raise RuntimeError("No API endpoint candidates found")
+
+            ordered_candidates = sorted(
+                candidates,
+                key=lambda candidate: _rank_api_candidate(page_url, candidate),
+                reverse=True,
+            )
+
+            for candidate in ordered_candidates[:16]:
                 endpoint = candidate if candidate.startswith("http") else urljoin(page_url, candidate)
                 try:
                     async with session.get(endpoint, allow_redirects=True) as response:
@@ -124,6 +137,74 @@ class ContentExtractor:
                     continue
 
         raise RuntimeError("API extraction did not return usable JSON content")
+
+    async def _discover_api_candidates_with_external_scripts(
+        self,
+        page_url: str,
+        raw_html: str,
+        session: aiohttp.ClientSession,
+    ) -> list[str]:
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def add(candidate: str) -> None:
+            if not candidate:
+                return
+            if candidate in seen:
+                return
+            seen.add(candidate)
+            candidates.append(candidate)
+
+        for candidate in discover_api_candidates(page_url, raw_html):
+            add(candidate)
+
+        soup = BeautifulSoup(raw_html, "html.parser")
+        script_urls: list[str] = []
+        for script in soup.find_all("script", src=True):
+            src = str(script.get("src", "")).strip()
+            if not src:
+                continue
+            script_urls.append(urljoin(page_url, src))
+
+        backend_bases: list[str] = []
+
+        for script_url in script_urls[:4]:
+            try:
+                async with session.get(script_url, allow_redirects=True) as response:
+                    if response.status >= 400:
+                        continue
+                    javascript = await response.text(errors="ignore")
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                continue
+
+            for base in re.findall(r"https?://[^\"'`\s,;)]*/api", javascript, flags=re.IGNORECASE):
+                normalized_base = base.rstrip("/")
+                if normalized_base not in backend_bases:
+                    backend_bases.append(normalized_base)
+
+            for pattern in [
+                r"\.get\(\s*[`\"']([^`\"']+)[`\"']",
+                r"\.post\(\s*[`\"']([^`\"']+)[`\"']",
+                r"\.put\(\s*[`\"']([^`\"']+)[`\"']",
+                r"\.patch\(\s*[`\"']([^`\"']+)[`\"']",
+                r"\.delete\(\s*[`\"']([^`\"']+)[`\"']",
+            ]:
+                for endpoint_path in re.findall(pattern, javascript):
+                    lowered = endpoint_path.lower()
+                    if not lowered.startswith("/"):
+                        continue
+                    if any(token in lowered for token in ["/auth/", "/admin", "/login", "/register"]):
+                        continue
+                    if "${" in endpoint_path:
+                        continue
+                    for base in backend_bases:
+                        add(f"{base}{endpoint_path}")
+
+        for base in backend_bases:
+            for guessed in _guess_spa_api_paths(page_url):
+                add(f"{base}{guessed}")
+
+        return candidates
 
     def _extract_from_static_html(
         self, url: str, html: str, forced_method: str | None = None
@@ -145,6 +226,11 @@ class ContentExtractor:
 
         if len(text) < 50:
             text = soup.get_text("\n", strip=True)
+
+        if len(text) < 50:
+            hint_text = _extract_semantic_hints(soup)
+            if hint_text:
+                text = hint_text
 
         if len(text) < 50:
             raise RuntimeError("Static HTML has insufficient content")
@@ -179,7 +265,11 @@ class ContentExtractor:
         )
 
     async def _render_with_browser(self, url: str) -> str:
-        _ensure_subprocess_supported_loop()
+        if not _is_playwright_loop_supported():
+            raise RuntimeError(
+                "Playwright browser rendering is disabled on Windows SelectorEventLoop."
+            )
+
         try:
             from playwright.async_api import async_playwright
         except ImportError as exc:
@@ -229,25 +319,104 @@ def _extract_title_from_html(html: str) -> str:
     return title_tag.get_text(strip=True) if title_tag else ""
 
 
+def _extract_semantic_hints(soup: BeautifulSoup) -> str:
+    hint_values: list[str] = []
+
+    for attr in ["description", "og:description", "twitter:description", "keywords", "author"]:
+        tag = soup.find("meta", attrs={"name": attr}) or soup.find("meta", attrs={"property": attr})
+        if tag and tag.get("content"):
+            hint_values.append(str(tag.get("content", "")).strip())
+
+    title_tag = soup.find("title")
+    if title_tag:
+        hint_values.append(title_tag.get_text(strip=True))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in hint_values:
+        compact = " ".join(value.split()).strip()
+        if not compact:
+            continue
+        lowered = compact.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(compact)
+
+    return "\n".join(deduped)
+
+
+def _guess_spa_api_paths(page_url: str) -> list[str]:
+    lowered = page_url.lower()
+
+    if "/about" in lowered or lowered.rstrip("/").endswith("mmsblog.com"):
+        return ["/author", "/posts/recent?limit=5"]
+    if "/blog" in lowered or "/articles" in lowered:
+        return ["/posts?page=1&limit=30", "/posts?limit=10", "/posts/recent?limit=5"]
+    if "/gallery" in lowered:
+        return ["/gallery"]
+    if "/interview" in lowered:
+        return ["/interviews"]
+
+    return ["/posts/recent?limit=5", "/posts?limit=10"]
+
+
+def _rank_api_candidate(page_url: str, candidate: str) -> int:
+    lowered_url = page_url.lower()
+    lowered_candidate = candidate.lower()
+
+    score = 0
+
+    if any(token in lowered_candidate for token in ["/auth/", "/admin", "/login", "/register"]):
+        return -100
+
+    if "/about" in lowered_url or lowered_url.rstrip("/").endswith("mmsblog.com"):
+        if "/author" in lowered_candidate:
+            score += 120
+        if "/posts/recent" in lowered_candidate:
+            score += 60
+        if "/posts" in lowered_candidate:
+            score += 20
+
+    if "/blog" in lowered_url or "/articles" in lowered_url:
+        if "/posts" in lowered_candidate:
+            score += 120
+        if "/interviews" in lowered_candidate:
+            score += 40
+
+    if "/gallery" in lowered_url and "/gallery" in lowered_candidate:
+        score += 120
+
+    if "/interview" in lowered_url and "/interviews" in lowered_candidate:
+        score += 120
+
+    if "/posts" in lowered_candidate:
+        score += 10
+    if "/author" in lowered_candidate:
+        score += 10
+    if "/gallery" in lowered_candidate:
+        score += 10
+    if "/interviews" in lowered_candidate:
+        score += 10
+
+    return score
+
+
 def _sha256(text: str) -> str:
     import hashlib
 
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _is_homepage(url: str) -> bool:
-    parsed = urlparse(url)
-    path = parsed.path or "/"
-    return path == "/" and not parsed.query
-
-
-def _ensure_subprocess_supported_loop() -> None:
+def _is_playwright_loop_supported() -> bool:
     if sys.platform != "win32":
-        return
+        return True
 
     loop = asyncio.get_running_loop()
     if isinstance(loop, asyncio.SelectorEventLoop):
-        raise RuntimeError(
-            "Playwright browser rendering requires Windows ProactorEventLoop. "
-            "Restart server with WindowsProactorEventLoopPolicy enabled."
+        logger.debug(
+            "Detected Windows SelectorEventLoop; skipping Playwright browser rendering."
         )
+        return False
+
+    return True
