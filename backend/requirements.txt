@@ -11,6 +11,7 @@ aiohttp>=3.10.0
 # Crawling
 crawlee[playwright]>=0.5.0
 playwright>=1.46.0
+fake_user_agent>=2.3.9
 
 # Text extraction & processing
 beautifulsoup4>=4.12.0
@@ -28,6 +29,9 @@ google-generativeai>=0.8.0
 
 # Vector DB
 pinecone>=5.0.0
+
+pandas>=2.0.0
+fake-useragent>=2.0.0
 
 # after pip install, run:
 # python -m playwright install chromium
