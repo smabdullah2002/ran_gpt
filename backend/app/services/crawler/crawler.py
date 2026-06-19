@@ -1,10 +1,11 @@
 import asyncio
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 from crawlee import ConcurrencySettings
 from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
+
+from app.services.processor.sitemap import fetch_sitemap
 
 
 async def crawl_to_csv(
@@ -16,6 +17,8 @@ async def crawl_to_csv(
 
     results: list[dict] = []
     output_path = Path(output_path)
+
+    print(f"\nCrawling {base_url} (max {max_pages} pages, concurrency={max_concurrency})...\n")
 
     crawler = PlaywrightCrawler(
         headless=True,
@@ -39,7 +42,6 @@ async def crawl_to_csv(
                 {
                     "url": url,
                     "title": title,
-                    "crawl_timestamp": datetime.now(timezone.utc).isoformat(),
                 }
             )
             print(f"  Title: {title}")
@@ -48,9 +50,6 @@ async def crawl_to_csv(
 
         await context.enqueue_links(selector="a[href]", strategy="same-domain")
 
-    print(
-        f"\nCrawling {base_url} (max {max_pages} pages, concurrency={max_concurrency})...\n"
-    )
     await crawler.run([base_url])
 
     df = pd.DataFrame(results)
@@ -60,5 +59,32 @@ async def crawl_to_csv(
     return results
 
 
+async def crawl_from_sitemap(
+    sitemap_url: str,
+    output_path: str | Path = "crawl_output.csv",
+) -> list[dict]:
+    results: list[dict] = []
+    output_path = Path(output_path)
+
+    urls = await fetch_sitemap(sitemap_url)
+    if not urls:
+        print(f"Failed to fetch sitemap: {sitemap_url}")
+        return results
+
+    results = [{"url": url} for url in urls]
+    df = pd.DataFrame(results)
+    df.to_csv(output_path, index=False, encoding="utf-8-sig")
+    print(f"Done. {len(results)} URLs from sitemap saved to {output_path}")
+    return results
+
+
 if __name__ == "__main__":
-    asyncio.run(crawl_to_csv("https://web-scraping.dev/"))
+    import sys
+
+    mode = sys.argv[1] if len(sys.argv) > 1 else "auto"
+    url = sys.argv[2] if len(sys.argv) > 2 else "https://www.studyfetch.com/"
+
+    if mode == "sitemap":
+        asyncio.run(crawl_from_sitemap(url))
+    else:
+        asyncio.run(crawl_to_csv(url))

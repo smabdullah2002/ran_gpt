@@ -1,6 +1,4 @@
-import argparse
 import asyncio
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -36,7 +34,6 @@ async def scrape_url(
                 "title": title,
                 "cleaned_text": cleaned_text,
                 "word_count": word_count,
-                "scrape_timestamp": datetime.now(timezone.utc).isoformat(),
             }
         except Exception as e:
             print(f"  ERROR on {url}: {e}")
@@ -45,7 +42,6 @@ async def scrape_url(
                 "title": "",
                 "cleaned_text": "",
                 "word_count": 0,
-                "scrape_timestamp": datetime.now(timezone.utc).isoformat(),
             }
         finally:
             await context.close()
@@ -89,37 +85,11 @@ async def scrape_csv(
     return results
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Playwright Scraper → CSV (reads crawler output)"
-    )
-    parser.add_argument(
-        "--input",
-        default="crawl_output.csv",
-        help="Input CSV file path from crawler (default: crawl_output.csv)",        
-    )
-    parser.add_argument(
-        "--output",
-        default="scraped_output.csv",
-        help="Output CSV file path (default: scraped_output.csv)",
-    )
-    parser.add_argument(
-        "--concurrency",
-        type=int,
-        default=5,
-        help="Max concurrent pages (default: 5)",
-    )
-
-    args = parser.parse_args()  
-
+if __name__ == "__main__":
     asyncio.run(
         scrape_csv(
-            input_path=args.input,
-            output_path=args.output,
-            max_concurrency=args.concurrency,
+            input_path="crawl_output.csv",
+            output_path="scraped_output.csv",
+            max_concurrency=5,
         )
     )
-
-
-if __name__ == "__main__":
-    main()
